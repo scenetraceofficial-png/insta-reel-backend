@@ -125,7 +125,7 @@ async function getYouTubeFrames(videoId) {
   return frames;
 }
 
-// 3. TikTok Direct Resolver (Tikwm)
+// 3. TikTok Direct Resolver (Tikwm) with fallback images
 async function resolveTikTok(url) {
   try {
     const res = await fetch(`https://www.tikwm.com/api/?url=${encodeURIComponent(url)}`, {
@@ -134,8 +134,11 @@ async function resolveTikTok(url) {
       }
     });
     const json = await res.json();
-    if (json && json.data && json.data.play) {
-      return json.data.play;
+    if (json && json.data) {
+      return {
+        streamUrl: json.data.play || json.data.wmplay || null,
+        covers: [json.data.cover, json.data.origin_cover].filter(Boolean)
+      };
     }
   } catch (e) {}
   return null;
@@ -153,18 +156,15 @@ async function resolveSnapchat(url) {
     });
     const html = await res.text();
 
-    // 1. Check contentUrl in Snapchat page data (Direct HD Video MP4)
     const cuMatches = html.match(/"contentUrl":"([^"]+)"/g);
     if (cuMatches && cuMatches.length > 0) {
       const first = cuMatches[0].replace(/"contentUrl":"|"/g, '');
       return first.replace(/\\u0026/g, '&').replace(/&amp;/g, '&');
     }
 
-    // 2. Check og:video
     const ogMatch = html.match(/<meta property="og:video(?::url)?" content="([^"]+)"/i);
     if (ogMatch && ogMatch[1]) return ogMatch[1].replace(/&amp;/g, '&');
 
-    // 3. Check sc-cdn direct links
     const cdnMatch = html.match(/https:\/\/(?:bolt-gcdn|cf-st)\.sc-cdn\.net\/[^\s"'<>\\]+/i);
     if (cdnMatch) return cdnMatch[0].replace(/\\u0026/g, '&').replace(/&amp;/g, '&');
   } catch (e) {}
@@ -196,10 +196,10 @@ app.all('/api/extract-frames', async (req, res) => {
 
   const tmpDir = path.join(os.tmpdir(), `extract_${Date.now()}`);
   fs.mkdirSync(tmpDir, { recursive: true });
-  const localVideoPath = path.join(tmpDir, 'video.mp4');
 
   try {
     let videoStreamUrl = null;
+    let tikTokData = null;
 
     // 2. Instagram Check
     if (inputUrl.includes('instagram.com') || inputUrl.includes('instagr.am')) {
@@ -208,44 +208,83 @@ app.all('/api/extract-frames', async (req, res) => {
         videoStreamUrl = await resolveInstagramFast(match[1]);
       }
     }
-    // 3. TikTok Check
+    // 3. TikTok Check (handles vm.tiktok.com, vt.tiktok.com, and tiktok.com)
     else if (inputUrl.includes('tiktok.com')) {
-      videoStreamUrl = await resolveTikTok(inputUrl);
+      tikTokData = await resolveTikTok(inputUrl);
+      if (tikTokData && tikTokData.streamUrl) {
+        videoStreamUrl = tikTokData.streamUrl;
+      }
     }
     // 4. Snapchat Check
     else if (inputUrl.includes('snapchat.com')) {
       videoStreamUrl = await resolveSnapchat(inputUrl);
     }
 
-    // 5. Download media to local temp storage
-    if (videoStreamUrl) {
-      execSync(`curl -s -L -A "Mozilla/5.0" "${videoStreamUrl}" -o "${localVideoPath}"`, { timeout: 25000 });
-    } else {
-      // Facebook & generic media
-      const ytdlpCmd = `yt-dlp -f "b[ext=mp4]/b" --no-playlist --socket-timeout 10 -o "${localVideoPath}" "${inputUrl}"`;
-      execSync(ytdlpCmd, { timeout: 30000, stdio: 'ignore' });
-    }
-
-    if (!fs.existsSync(localVideoPath) || fs.statSync(localVideoPath).size === 0) {
-      throw new Error('Could not download video file from URL');
-    }
-
-    // 6. Extract 3 frames via FFmpeg
-    const timestamps = ['00:00:01', '00:00:03', '00:00:05'];
     const framesBase64 = [];
 
-    for (let i = 0; i < timestamps.length; i++) {
-      const outPath = path.join(tmpDir, `frame_${i + 1}.jpg`);
+    // FAST DIRECT EXTRACTION: Agar direct stream URL mil gaya (Instagram / TikTok / Snapchat)
+    if (videoStreamUrl) {
+      // Direct stream extraction bina poori video download kiye (single pass, superfast)
       try {
-        execSync(`ffmpeg -y -ss ${timestamps[i]} -i "${localVideoPath}" -vframes 1 -q:v 2 "${outPath}"`, {
-          timeout: 5000,
-          stdio: 'ignore'
-        });
-        if (fs.existsSync(outPath) && fs.statSync(outPath).size > 0) {
-          const buf = fs.readFileSync(outPath);
-          framesBase64.push(`data:image/jpeg;base64,${buf.toString('base64')}`);
+        const streamCmd = `ffmpeg -y -headers "User-Agent: Mozilla/5.0\\r\\n" -ss 00:00:01 -i "${videoStreamUrl}" -vf "fps=1/2" -vframes 3 -q:v 2 "${path.join(tmpDir, 'f_%d.jpg')}"`;
+        execSync(streamCmd, { timeout: 15000, stdio: 'ignore' });
+
+        for (let i = 1; i <= 3; i++) {
+          const p = path.join(tmpDir, `f_${i}.jpg`);
+          if (fs.existsSync(p) && fs.statSync(p).size > 0) {
+            framesBase64.push(`data:image/jpeg;base64,${fs.readFileSync(p).toString('base64')}`);
+          }
         }
-      } catch (err) {}
+      } catch (streamErr) {
+        // Fallback: Agar stream fail hui toh fast download try karein
+        const localVideoPath = path.join(tmpDir, 'video.mp4');
+        try {
+          execSync(`curl -s -L -A "Mozilla/5.0" "${videoStreamUrl}" -o "${localVideoPath}"`, { timeout: 20000 });
+          if (fs.existsSync(localVideoPath) && fs.statSync(localVideoPath).size > 0) {
+            const timestamps = ['00:00:01', '00:00:03', '00:00:05'];
+            for (let i = 0; i < timestamps.length; i++) {
+              const outPath = path.join(tmpDir, `fb_${i + 1}.jpg`);
+              try {
+                execSync(`ffmpeg -y -ss ${timestamps[i]} -i "${localVideoPath}" -vframes 1 -q:v 2 "${outPath}"`, { timeout: 5000, stdio: 'ignore' });
+                if (fs.existsSync(outPath) && fs.statSync(outPath).size > 0) {
+                  framesBase64.push(`data:image/jpeg;base64,${fs.readFileSync(outPath).toString('base64')}`);
+                }
+              } catch (e) {}
+            }
+          }
+        } catch (downloadErr) {}
+      }
+    } else {
+      // Facebook & generic video links via yt-dlp
+      const localVideoPath = path.join(tmpDir, 'video.mp4');
+      const ytdlpCmd = `yt-dlp -f "b[ext=mp4]/b" --no-playlist --socket-timeout 15 -o "${localVideoPath}" "${inputUrl}"`;
+      execSync(ytdlpCmd, { timeout: 35000, stdio: 'ignore' });
+
+      if (fs.existsSync(localVideoPath) && fs.statSync(localVideoPath).size > 0) {
+        const timestamps = ['00:00:01', '00:00:03', '00:00:05'];
+        for (let i = 0; i < timestamps.length; i++) {
+          const outPath = path.join(tmpDir, `frame_${i + 1}.jpg`);
+          try {
+            execSync(`ffmpeg -y -ss ${timestamps[i]} -i "${localVideoPath}" -vframes 1 -q:v 2 "${outPath}"`, { timeout: 5000, stdio: 'ignore' });
+            if (fs.existsSync(outPath) && fs.statSync(outPath).size > 0) {
+              framesBase64.push(`data:image/jpeg;base64,${fs.readFileSync(outPath).toString('base64')}`);
+            }
+          } catch (err) {}
+        }
+      }
+    }
+
+    // Safety Fallback for TikTok (Cover images if any error happens)
+    if (framesBase64.length === 0 && tikTokData && tikTokData.covers.length > 0) {
+      for (const cov of tikTokData.covers) {
+        try {
+          const r = await fetch(cov);
+          if (r.ok) {
+            const buf = await r.arrayBuffer();
+            framesBase64.push(`data:image/jpeg;base64,${Buffer.from(buf).toString('base64')}`);
+          }
+        } catch (e) {}
+      }
     }
 
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
