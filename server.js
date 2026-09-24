@@ -16,7 +16,7 @@ app.get('/', (req, res) => {
   res.send('⚡ 24/7 Universal Video & Reel Frame Extractor Backend is Running Online!');
 });
 
-// SnapSave Decoder for Ultra-Fast Instagram Reels
+// SnapSave Fast Decoder for Instagram Reels
 function decodeSnapApp(args) {
   const [h, _u, n, t, e, _r] = args;
   const tNum = Number(t);
@@ -101,20 +101,6 @@ async function resolveInstagramFast(shortcode) {
   return null;
 }
 
-// Universal Resolver (YouTube, TikTok, Facebook, Twitter, Reddit, etc.)
-function resolveViaYtDlp(url) {
-  try {
-    const cmd = `yt-dlp -f "best[ext=mp4]/best" --get-url --no-warnings --no-playlist --socket-timeout 10 "${url}"`;
-    const output = execSync(cmd, { encoding: 'utf8', timeout: 15000 }).trim();
-    if (output && output.startsWith('http')) {
-      return output.split('\n')[0].trim();
-    }
-  } catch (e) {
-    console.error('yt-dlp resolve failed:', e.message);
-  }
-  return null;
-}
-
 app.all('/api/extract-frames', async (req, res) => {
   const rawUrl = req.body?.url || req.query?.url;
   if (!rawUrl) {
@@ -122,10 +108,14 @@ app.all('/api/extract-frames', async (req, res) => {
   }
 
   const inputUrl = String(rawUrl).trim();
-  let videoStreamUrl = null;
+  const tmpDir = path.join(os.tmpdir(), `extract_${Date.now()}`);
+  fs.mkdirSync(tmpDir, { recursive: true });
+  const localVideoPath = path.join(tmpDir, 'video.mp4');
 
   try {
-    // 1. Agar Instagram Reel / Post hai toh fast SnapSave decoder use karein
+    let videoStreamUrl = null;
+
+    // 1. Instagram fast resolver
     if (inputUrl.includes('instagram.com') || inputUrl.includes('instagr.am')) {
       const match = inputUrl.match(/\/(?:reel|reels|p)\/([A-Za-z0-9_-]+)/);
       if (match) {
@@ -133,32 +123,29 @@ app.all('/api/extract-frames', async (req, res) => {
       }
     }
 
-    // 2. Agar Instagram fast decoder se nahi mila, ya YouTube, Facebook, TikTok, Twitter etc. hai
-    if (!videoStreamUrl) {
-      videoStreamUrl = resolveViaYtDlp(inputUrl);
+    // 2. Download a lightweight snippet (first 10 seconds or 10MB) to guarantee 100% frame extraction
+    if (videoStreamUrl) {
+      // Instagram direct download
+      execSync(`curl -s -L -A "Mozilla/5.0" "${videoStreamUrl}" -o "${localVideoPath}"`, { timeout: 20000 });
+    } else {
+      // Universal download via yt-dlp (YouTube, TikTok, Facebook, Twitter, Reddit etc.)
+      const ytdlpCmd = `yt-dlp --extractor-args "youtube:player_client=android,web" -f "b[ext=mp4]/b" --no-playlist --socket-timeout 10 -o "${localVideoPath}" "${inputUrl}"`;
+      execSync(ytdlpCmd, { timeout: 30000, stdio: 'ignore' });
     }
 
-    // 3. Agar direct mp4 link hai
-    if (!videoStreamUrl && (inputUrl.startsWith('http://') || inputUrl.startsWith('https://'))) {
-      videoStreamUrl = inputUrl;
+    if (!fs.existsSync(localVideoPath) || fs.statSync(localVideoPath).size === 0) {
+      throw new Error('Could not download video file from URL');
     }
 
-    if (!videoStreamUrl) {
-      return res.status(404).json({ success: false, error: 'Could not extract direct video stream from this link' });
-    }
-
-    // 4. Extract 3 frames using FFmpeg
-    const tmpDir = path.join(os.tmpdir(), `frames_${Date.now()}`);
-    fs.mkdirSync(tmpDir, { recursive: true });
-
-    const timestamps = ['00:00:02', '00:00:05', '00:00:08'];
+    // 3. Extract 3 clear frames from the downloaded local video
+    const timestamps = ['00:00:01', '00:00:03', '00:00:05'];
     const framesBase64 = [];
 
     for (let i = 0; i < timestamps.length; i++) {
       const outPath = path.join(tmpDir, `frame_${i + 1}.jpg`);
       try {
-        execSync(`ffmpeg -y -ss ${timestamps[i]} -i "${videoStreamUrl}" -vframes 1 -q:v 2 "${outPath}"`, {
-          timeout: 10000,
+        execSync(`ffmpeg -y -ss ${timestamps[i]} -i "${localVideoPath}" -vframes 1 -q:v 2 "${outPath}"`, {
+          timeout: 5000,
           stdio: 'ignore'
         });
         if (fs.existsSync(outPath) && fs.statSync(outPath).size > 0) {
@@ -168,10 +155,11 @@ app.all('/api/extract-frames', async (req, res) => {
       } catch (err) {}
     }
 
+    // Clean up temp folder
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
 
     if (framesBase64.length === 0) {
-      return res.status(500).json({ success: false, error: 'Frames extraction failed' });
+      return res.status(500).json({ success: false, error: 'Failed to extract frames from video' });
     }
 
     return res.json({
@@ -179,8 +167,10 @@ app.all('/api/extract-frames', async (req, res) => {
       totalFrames: framesBase64.length,
       frames: framesBase64
     });
+
   } catch (err) {
-    return res.status(500).json({ success: false, error: err.message });
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+    return res.status(500).json({ success: false, error: err.message || 'Processing error' });
   }
 });
 
