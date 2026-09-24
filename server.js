@@ -16,7 +16,7 @@ app.get('/', (req, res) => {
   res.send('⚡ 24/7 Universal Video & Reel Frame Extractor Backend is Running Online!');
 });
 
-// SnapSave Fast Decoder for Instagram Reels
+// 1. SnapSave Fast Decoder for Instagram Reels
 function decodeSnapApp(args) {
   const [h, _u, n, t, e, _r] = args;
   const tNum = Number(t);
@@ -101,7 +101,7 @@ async function resolveInstagramFast(shortcode) {
   return null;
 }
 
-// 1. YouTube Frame Extractor
+// 2. YouTube Instant Frame Extractor
 function extractYouTubeId(url) {
   const m = url.match(/(?:shorts\/|v=|youtu\.be\/|\/embed\/|\/v\/)([a-zA-Z0-9_-]{11})/);
   return m ? m[1] : null;
@@ -125,7 +125,7 @@ async function getYouTubeFrames(videoId) {
   return frames;
 }
 
-// 2. TikTok Direct Resolver (Tikwm)
+// 3. TikTok Direct Resolver (Tikwm)
 async function resolveTikTok(url) {
   try {
     const res = await fetch(`https://www.tikwm.com/api/?url=${encodeURIComponent(url)}`, {
@@ -141,7 +141,7 @@ async function resolveTikTok(url) {
   return null;
 }
 
-// 3. Snapchat Spotlight / Stories Resolver
+// 4. Snapchat Spotlight & Stories Resolver
 async function resolveSnapchat(url) {
   try {
     const res = await fetch(url, {
@@ -152,18 +152,21 @@ async function resolveSnapchat(url) {
       redirect: 'follow'
     });
     const html = await res.text();
-    // Check og:video
-    const ogMatch = html.match(/<meta property="og:video(?::url)?" content="([^"]+)"/i);
-    if (ogMatch && ogMatch[1]) return ogMatch[1];
 
-    // Check media urls in Next.js page state
-    const nextMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([^<]+)<\/script>/);
-    if (nextMatch) {
-      const mp4Match = nextMatch[1].match(/https:\/\/[^"'\s]+\.mp4[^"'\s]*/i);
-      if (mp4Match) return mp4Match[0];
-      const cdnMatch = nextMatch[1].match(/https:\/\/cf-st\.sc-cdn\.net\/d\/[^"'\s\\]+/i);
-      if (cdnMatch) return cdnMatch[0].replace(/\\u0026/g, '&');
+    // 1. Check contentUrl in Snapchat page data (Direct HD Video MP4)
+    const cuMatches = html.match(/"contentUrl":"([^"]+)"/g);
+    if (cuMatches && cuMatches.length > 0) {
+      const first = cuMatches[0].replace(/"contentUrl":"|"/g, '');
+      return first.replace(/\\u0026/g, '&').replace(/&amp;/g, '&');
     }
+
+    // 2. Check og:video
+    const ogMatch = html.match(/<meta property="og:video(?::url)?" content="([^"]+)"/i);
+    if (ogMatch && ogMatch[1]) return ogMatch[1].replace(/&amp;/g, '&');
+
+    // 3. Check sc-cdn direct links
+    const cdnMatch = html.match(/https:\/\/(?:bolt-gcdn|cf-st)\.sc-cdn\.net\/[^\s"'<>\\]+/i);
+    if (cdnMatch) return cdnMatch[0].replace(/\\u0026/g, '&').replace(/&amp;/g, '&');
   } catch (e) {}
   return null;
 }
