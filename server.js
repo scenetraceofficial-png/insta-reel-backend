@@ -101,6 +101,31 @@ async function resolveInstagramFast(shortcode) {
   return null;
 }
 
+// Extract YouTube Video ID
+function extractYouTubeId(url) {
+  const m = url.match(/(?:shorts\/|v=|youtu\.be\/|\/embed\/|\/v\/)([a-zA-Z0-9_-]{11})/);
+  return m ? m[1] : null;
+}
+
+// Fetch YouTube native frames (Instant 0.2s)
+async function getYouTubeFrames(videoId) {
+  const frameNames = ['hqdefault.jpg', '1.jpg', '2.jpg', '3.jpg'];
+  const frames = [];
+
+  for (const name of frameNames) {
+    try {
+      const imgRes = await fetch(`https://i.ytimg.com/vi/${videoId}/${name}`);
+      if (imgRes.ok) {
+        const arrayBuf = await imgRes.arrayBuffer();
+        const base64 = Buffer.from(arrayBuf).toString('base64');
+        frames.push(`data:image/jpeg;base64,${base64}`);
+        if (frames.length >= 3) break;
+      }
+    } catch (e) {}
+  }
+  return frames;
+}
+
 app.all('/api/extract-frames', async (req, res) => {
   const rawUrl = req.body?.url || req.query?.url;
   if (!rawUrl) {
@@ -108,6 +133,22 @@ app.all('/api/extract-frames', async (req, res) => {
   }
 
   const inputUrl = String(rawUrl).trim();
+
+  // 1. Check if YouTube Shorts or Video
+  const ytId = extractYouTubeId(inputUrl);
+  if (ytId) {
+    try {
+      const ytFrames = await getYouTubeFrames(ytId);
+      if (ytFrames.length > 0) {
+        return res.json({
+          success: true,
+          totalFrames: ytFrames.length,
+          frames: ytFrames
+        });
+      }
+    } catch (e) {}
+  }
+
   const tmpDir = path.join(os.tmpdir(), `extract_${Date.now()}`);
   fs.mkdirSync(tmpDir, { recursive: true });
   const localVideoPath = path.join(tmpDir, 'video.mp4');
@@ -115,7 +156,7 @@ app.all('/api/extract-frames', async (req, res) => {
   try {
     let videoStreamUrl = null;
 
-    // 1. Instagram fast resolver
+    // 2. Instagram Fast Resolver
     if (inputUrl.includes('instagram.com') || inputUrl.includes('instagr.am')) {
       const match = inputUrl.match(/\/(?:reel|reels|p)\/([A-Za-z0-9_-]+)/);
       if (match) {
@@ -123,13 +164,12 @@ app.all('/api/extract-frames', async (req, res) => {
       }
     }
 
-    // 2. Download a lightweight snippet (first 10 seconds or 10MB) to guarantee 100% frame extraction
+    // 3. Download video to local temp
     if (videoStreamUrl) {
-      // Instagram direct download
       execSync(`curl -s -L -A "Mozilla/5.0" "${videoStreamUrl}" -o "${localVideoPath}"`, { timeout: 20000 });
     } else {
-      // Universal download via yt-dlp (YouTube, TikTok, Facebook, Twitter, Reddit etc.)
-      const ytdlpCmd = `yt-dlp --extractor-args "youtube:player_client=android,web" -f "b[ext=mp4]/b" --no-playlist --socket-timeout 10 -o "${localVideoPath}" "${inputUrl}"`;
+      // Facebook or other supported media
+      const ytdlpCmd = `yt-dlp -f "b[ext=mp4]/b" --no-playlist --socket-timeout 10 -o "${localVideoPath}" "${inputUrl}"`;
       execSync(ytdlpCmd, { timeout: 30000, stdio: 'ignore' });
     }
 
@@ -137,7 +177,7 @@ app.all('/api/extract-frames', async (req, res) => {
       throw new Error('Could not download video file from URL');
     }
 
-    // 3. Extract 3 clear frames from the downloaded local video
+    // 4. Extract 3 frames using FFmpeg
     const timestamps = ['00:00:01', '00:00:03', '00:00:05'];
     const framesBase64 = [];
 
@@ -155,7 +195,6 @@ app.all('/api/extract-frames', async (req, res) => {
       } catch (err) {}
     }
 
-    // Clean up temp folder
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
 
     if (framesBase64.length === 0) {
