@@ -6,18 +6,16 @@ const path = require('path');
 const os = require('os');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Health Check route
 app.get('/', (req, res) => {
   res.send('⚡ 24/7 Instagram & Video Frame Extractor Backend is Running Online!');
 });
 
-// SnapSave Decoder Helper
 function decodeSnapApp(args) {
   const [h, _u, n, t, e, _r] = args;
   const tNum = Number(t);
@@ -55,57 +53,67 @@ function decodeSnapApp(args) {
   return decodeURIComponent(escape(res));
 }
 
-// 1. Instagram Direct MP4 Resolver
 async function resolveInstagramMp4(shortcode) {
   try {
-    const target = `https://www.instagram.com/reel/${shortcode}/`;
+    const target = 'https://www.instagram.com/reel/' + shortcode + '/';
     const formData = new URLSearchParams();
     formData.append('url', target);
-
-    const resp = await fetch('https://snapsave.app/action.php?lang=en', {
+    const res = await fetch('https://snapsave.app/action.php?lang=en', {
       method: 'POST',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer': 'https://snapsave.app/',
-        'Content-Type': 'application/x-www-form-urlencoded',
+        'accept': '*/*',
+        'content-type': 'application/x-www-form-urlencoded',
+        'origin': 'https://snapsave.app',
+        'referer': 'https://snapsave.app/',
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       },
       body: formData.toString(),
     });
-
-    const body = await resp.text();
-    const snapMatch = body.match(/eval\(function\(p,a,c,k,e,d\)[\s\S]*?\}\(([\s\S]*?)\)\)/);
-    if (snapMatch && snapMatch[1]) {
-      const argsRaw = snapMatch[1];
-      const parsedArgs = JSON.parse(`[${argsRaw}]`);
-      const unpacked = decodeSnapApp(parsedArgs);
-      const downloadMatches = [...unpacked.matchAll(/href="([^"]+)"/g)];
-      for (const m of downloadMatches) {
-        if (m[1] && m[1].startsWith('http') && m[1].includes('.mp4')) {
-          return m[1];
-        }
+    if (!res.ok) return null;
+    const raw = await res.text();
+    const part1 = raw.split('decodeURIComponent(escape(r))}(')[1];
+    if (!part1) return null;
+    const lastParen = part1.lastIndexOf('))');
+    if (lastParen === -1) return null;
+    const argsStr = part1.slice(0, lastParen);
+    const args = eval('[' + argsStr + ']');
+    if (!args || args.length < 6) return null;
+    const decoded = decodeSnapApp(args);
+    const cleanHtml = decoded.replace(/\\/g, '');
+    const rapidMatch = cleanHtml.match(/https:\/\/d\.rapidcdn\.app\/v2\?token=[^"'\s]+/i);
+    if (rapidMatch) {
+      const fullRapidUrl = rapidMatch[0].replace(/&amp;/g, '&');
+      const tokenMatch = fullRapidUrl.match(/token=([a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)/);
+      if (tokenMatch && tokenMatch[1]) {
+        try {
+          const payloadJson = Buffer.from(tokenMatch[1].split('.')[1], 'base64').toString('utf8');
+          const parsed = JSON.parse(payloadJson);
+          if (parsed.url && (parsed.url.includes('.mp4') || parsed.url.includes('cdninstagram.com'))) {
+            return parsed.url;
+          }
+        } catch (err) {}
       }
+      return fullRapidUrl;
     }
-  } catch (e) {
-    console.error('SnapSave Error:', e.message);
+    const mp4Match = cleanHtml.match(/https:\/\/[^"'\s]+?\.mp4[^"'\s]*/i);
+    if (mp4Match) return mp4Match[0];
+  } catch (err) {
+    console.error('SnapSave Error:', err);
   }
 
-  // EEInstagram Fallback
+  // Fallback
   try {
     const eeRes = await fetch(`https://eeinstagram.com/reel/${shortcode}/`, {
       headers: { 'User-Agent': 'TelegramBot (like TwitterBot)' },
     });
     const html = await eeRes.text();
     const ogMatch = html.match(/<meta[^>]+property=["']og:video["'][^>]+content=["']([^"']+)["']/i);
-    if (ogMatch && ogMatch[1] && ogMatch[1].includes('.mp4')) {
-      return ogMatch[1];
-    }
-  } catch (e) {
-    console.error('EEInstagram Error:', e.message);
-  }
+    if (ogMatch && ogMatch[1]) return ogMatch[1];
+  } catch (e) {}
+
   return null;
 }
 
-// 2. MAIN FLUTTER API: Extract 3 Random Frames
 app.all('/api/extract-frames', async (req, res) => {
   const rawUrl = req.body?.url || req.query?.url;
   if (!rawUrl) {
@@ -116,7 +124,6 @@ app.all('/api/extract-frames', async (req, res) => {
   let videoStreamUrl = inputUrl;
 
   try {
-    // Agar Instagram URL hai toh direct CDN MP4 nikaalo
     if (inputUrl.includes('instagram.com') || inputUrl.includes('instagr.am')) {
       const match = inputUrl.match(/\/(?:reel|reels|p)\/([A-Za-z0-9_-]+)/);
       if (!match) {
@@ -130,11 +137,9 @@ app.all('/api/extract-frames', async (req, res) => {
       videoStreamUrl = direct;
     }
 
-    // Temporary folder for frames
     const tmpDir = path.join(os.tmpdir(), `frames_${Date.now()}`);
     fs.mkdirSync(tmpDir, { recursive: true });
 
-    // 3 Random/spaced timestamps (2s, 5s, 8s)
     const timestamps = ['00:00:02', '00:00:05', '00:00:08'];
     const framesBase64 = [];
 
@@ -150,11 +155,10 @@ app.all('/api/extract-frames', async (req, res) => {
           framesBase64.push(`data:image/jpeg;base64,${buf.toString('base64')}`);
         }
       } catch (err) {
-        console.error(`Frame ${i + 1} capture error:`, err.message);
+        console.error(`Frame error:`, err.message);
       }
     }
 
-    // Clean up temp files
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
 
     if (framesBase64.length === 0) {
@@ -166,7 +170,6 @@ app.all('/api/extract-frames', async (req, res) => {
       totalFrames: framesBase64.length,
       frames: framesBase64
     });
-
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
