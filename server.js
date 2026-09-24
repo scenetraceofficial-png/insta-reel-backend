@@ -13,9 +13,10 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 app.get('/', (req, res) => {
-  res.send('⚡ 24/7 Instagram & Video Frame Extractor Backend is Running Online!');
+  res.send('⚡ 24/7 Universal Video & Reel Frame Extractor Backend is Running Online!');
 });
 
+// SnapSave Decoder for Ultra-Fast Instagram Reels
 function decodeSnapApp(args) {
   const [h, _u, n, t, e, _r] = args;
   const tNum = Number(t);
@@ -53,7 +54,7 @@ function decodeSnapApp(args) {
   return decodeURIComponent(escape(res));
 }
 
-async function resolveInstagramMp4(shortcode) {
+async function resolveInstagramFast(shortcode) {
   try {
     const target = 'https://www.instagram.com/reel/' + shortcode + '/';
     const formData = new URLSearchParams();
@@ -75,8 +76,7 @@ async function resolveInstagramMp4(shortcode) {
     if (!part1) return null;
     const lastParen = part1.lastIndexOf('))');
     if (lastParen === -1) return null;
-    const argsStr = part1.slice(0, lastParen);
-    const args = eval('[' + argsStr + ']');
+    const args = eval('[' + part1.slice(0, lastParen) + ']');
     if (!args || args.length < 6) return null;
     const decoded = decodeSnapApp(args);
     const cleanHtml = decoded.replace(/\\/g, '');
@@ -97,20 +97,21 @@ async function resolveInstagramMp4(shortcode) {
     }
     const mp4Match = cleanHtml.match(/https:\/\/[^"'\s]+?\.mp4[^"'\s]*/i);
     if (mp4Match) return mp4Match[0];
-  } catch (err) {
-    console.error('SnapSave Error:', err);
-  }
+  } catch (err) {}
+  return null;
+}
 
-  // Fallback
+// Universal Resolver (YouTube, TikTok, Facebook, Twitter, Reddit, etc.)
+function resolveViaYtDlp(url) {
   try {
-    const eeRes = await fetch(`https://eeinstagram.com/reel/${shortcode}/`, {
-      headers: { 'User-Agent': 'TelegramBot (like TwitterBot)' },
-    });
-    const html = await eeRes.text();
-    const ogMatch = html.match(/<meta[^>]+property=["']og:video["'][^>]+content=["']([^"']+)["']/i);
-    if (ogMatch && ogMatch[1]) return ogMatch[1];
-  } catch (e) {}
-
+    const cmd = `yt-dlp -f "best[ext=mp4]/best" --get-url --no-warnings --no-playlist --socket-timeout 10 "${url}"`;
+    const output = execSync(cmd, { encoding: 'utf8', timeout: 15000 }).trim();
+    if (output && output.startsWith('http')) {
+      return output.split('\n')[0].trim();
+    }
+  } catch (e) {
+    console.error('yt-dlp resolve failed:', e.message);
+  }
   return null;
 }
 
@@ -121,22 +122,32 @@ app.all('/api/extract-frames', async (req, res) => {
   }
 
   const inputUrl = String(rawUrl).trim();
-  let videoStreamUrl = inputUrl;
+  let videoStreamUrl = null;
 
   try {
+    // 1. Agar Instagram Reel / Post hai toh fast SnapSave decoder use karein
     if (inputUrl.includes('instagram.com') || inputUrl.includes('instagr.am')) {
       const match = inputUrl.match(/\/(?:reel|reels|p)\/([A-Za-z0-9_-]+)/);
-      if (!match) {
-        return res.status(400).json({ success: false, error: 'Invalid Instagram URL' });
+      if (match) {
+        videoStreamUrl = await resolveInstagramFast(match[1]);
       }
-      const shortcode = match[1];
-      const direct = await resolveInstagramMp4(shortcode);
-      if (!direct) {
-        return res.status(404).json({ success: false, error: 'Could not extract direct video stream' });
-      }
-      videoStreamUrl = direct;
     }
 
+    // 2. Agar Instagram fast decoder se nahi mila, ya YouTube, Facebook, TikTok, Twitter etc. hai
+    if (!videoStreamUrl) {
+      videoStreamUrl = resolveViaYtDlp(inputUrl);
+    }
+
+    // 3. Agar direct mp4 link hai
+    if (!videoStreamUrl && (inputUrl.startsWith('http://') || inputUrl.startsWith('https://'))) {
+      videoStreamUrl = inputUrl;
+    }
+
+    if (!videoStreamUrl) {
+      return res.status(404).json({ success: false, error: 'Could not extract direct video stream from this link' });
+    }
+
+    // 4. Extract 3 frames using FFmpeg
     const tmpDir = path.join(os.tmpdir(), `frames_${Date.now()}`);
     fs.mkdirSync(tmpDir, { recursive: true });
 
@@ -154,9 +165,7 @@ app.all('/api/extract-frames', async (req, res) => {
           const buf = fs.readFileSync(outPath);
           framesBase64.push(`data:image/jpeg;base64,${buf.toString('base64')}`);
         }
-      } catch (err) {
-        console.error(`Frame error:`, err.message);
-      }
+      } catch (err) {}
     }
 
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
@@ -176,5 +185,5 @@ app.all('/api/extract-frames', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+  console.log(`Universal Server listening on port ${PORT}`);
 });
