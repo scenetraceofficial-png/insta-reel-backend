@@ -101,13 +101,12 @@ async function resolveInstagramFast(shortcode) {
   return null;
 }
 
-// Extract YouTube Video ID
+// 1. YouTube Frame Extractor
 function extractYouTubeId(url) {
   const m = url.match(/(?:shorts\/|v=|youtu\.be\/|\/embed\/|\/v\/)([a-zA-Z0-9_-]{11})/);
   return m ? m[1] : null;
 }
 
-// Fetch YouTube native frames (Instant 0.2s)
 async function getYouTubeFrames(videoId) {
   const frameNames = ['hqdefault.jpg', '1.jpg', '2.jpg', '3.jpg'];
   const frames = [];
@@ -126,6 +125,49 @@ async function getYouTubeFrames(videoId) {
   return frames;
 }
 
+// 2. TikTok Direct Resolver (Tikwm)
+async function resolveTikTok(url) {
+  try {
+    const res = await fetch(`https://www.tikwm.com/api/?url=${encodeURIComponent(url)}`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
+    });
+    const json = await res.json();
+    if (json && json.data && json.data.play) {
+      return json.data.play;
+    }
+  } catch (e) {}
+  return null;
+}
+
+// 3. Snapchat Spotlight / Stories Resolver
+async function resolveSnapchat(url) {
+  try {
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+      },
+      redirect: 'follow'
+    });
+    const html = await res.text();
+    // Check og:video
+    const ogMatch = html.match(/<meta property="og:video(?::url)?" content="([^"]+)"/i);
+    if (ogMatch && ogMatch[1]) return ogMatch[1];
+
+    // Check media urls in Next.js page state
+    const nextMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([^<]+)<\/script>/);
+    if (nextMatch) {
+      const mp4Match = nextMatch[1].match(/https:\/\/[^"'\s]+\.mp4[^"'\s]*/i);
+      if (mp4Match) return mp4Match[0];
+      const cdnMatch = nextMatch[1].match(/https:\/\/cf-st\.sc-cdn\.net\/d\/[^"'\s\\]+/i);
+      if (cdnMatch) return cdnMatch[0].replace(/\\u0026/g, '&');
+    }
+  } catch (e) {}
+  return null;
+}
+
 app.all('/api/extract-frames', async (req, res) => {
   const rawUrl = req.body?.url || req.query?.url;
   if (!rawUrl) {
@@ -134,7 +176,7 @@ app.all('/api/extract-frames', async (req, res) => {
 
   const inputUrl = String(rawUrl).trim();
 
-  // 1. Check if YouTube Shorts or Video
+  // 1. YouTube Shorts & Videos Check
   const ytId = extractYouTubeId(inputUrl);
   if (ytId) {
     try {
@@ -156,19 +198,27 @@ app.all('/api/extract-frames', async (req, res) => {
   try {
     let videoStreamUrl = null;
 
-    // 2. Instagram Fast Resolver
+    // 2. Instagram Check
     if (inputUrl.includes('instagram.com') || inputUrl.includes('instagr.am')) {
       const match = inputUrl.match(/\/(?:reel|reels|p)\/([A-Za-z0-9_-]+)/);
       if (match) {
         videoStreamUrl = await resolveInstagramFast(match[1]);
       }
     }
+    // 3. TikTok Check
+    else if (inputUrl.includes('tiktok.com')) {
+      videoStreamUrl = await resolveTikTok(inputUrl);
+    }
+    // 4. Snapchat Check
+    else if (inputUrl.includes('snapchat.com')) {
+      videoStreamUrl = await resolveSnapchat(inputUrl);
+    }
 
-    // 3. Download video to local temp
+    // 5. Download media to local temp storage
     if (videoStreamUrl) {
-      execSync(`curl -s -L -A "Mozilla/5.0" "${videoStreamUrl}" -o "${localVideoPath}"`, { timeout: 20000 });
+      execSync(`curl -s -L -A "Mozilla/5.0" "${videoStreamUrl}" -o "${localVideoPath}"`, { timeout: 25000 });
     } else {
-      // Facebook or other supported media
+      // Facebook & generic media
       const ytdlpCmd = `yt-dlp -f "b[ext=mp4]/b" --no-playlist --socket-timeout 10 -o "${localVideoPath}" "${inputUrl}"`;
       execSync(ytdlpCmd, { timeout: 30000, stdio: 'ignore' });
     }
@@ -177,7 +227,7 @@ app.all('/api/extract-frames', async (req, res) => {
       throw new Error('Could not download video file from URL');
     }
 
-    // 4. Extract 3 frames using FFmpeg
+    // 6. Extract 3 frames via FFmpeg
     const timestamps = ['00:00:01', '00:00:03', '00:00:05'];
     const framesBase64 = [];
 
