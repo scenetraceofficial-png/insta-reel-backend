@@ -16,6 +16,37 @@ app.get('/', (req, res) => {
   res.send('⚡ 24/7 Universal Video & Reel Frame Extractor Backend is Running Online!');
 });
 
+// Helper Function: Get random timestamps based on video duration
+function getRandomTimestamps(videoPath, count = 3) {
+  try {
+    const durationOutput = execSync(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`, { encoding: 'utf8' });
+    let duration = parseFloat(durationOutput.trim());
+    
+    // Safefall: If video is too short or ffprobe fails, return defaults
+    if (isNaN(duration) || duration < 3) {
+      return ['00:00:01', '00:00:02', '00:00:03'];
+    }
+
+    const timestamps = [];
+    const minDiff = duration / (count + 1); // Ensure spacing between frames
+
+    for (let i = 0; i < count; i++) {
+      let segmentStart = (i * minDiff) + 1; // skip first second to avoid black screens
+      let segmentEnd = ((i + 1) * minDiff);
+      if (segmentEnd > duration - 1) segmentEnd = duration - 1;
+      
+      let randomSec = Math.random() * (segmentEnd - segmentStart) + segmentStart;
+      let date = new Date(0);
+      date.setSeconds(randomSec);
+      let timeString = date.toISOString().substr(11, 8); // HH:MM:SS format
+      timestamps.push(timeString);
+    }
+    return timestamps;
+  } catch (e) {
+    return ['00:00:01', '00:00:03', '00:00:05']; // Fallback
+  }
+}
+
 // 1. SnapSave Fast Decoder for Instagram Reels
 function decodeSnapApp(args) {
   const [h, _u, n, t, e, _r] = args;
@@ -179,16 +210,17 @@ app.all('/api/extract-frames', async (req, res) => {
 
   const inputUrl = String(rawUrl).trim();
 
-  // 1. YouTube Shorts & Videos Check
+  // 1. YouTube Shorts Check
   const ytId = extractYouTubeId(inputUrl);
   if (ytId) {
     try {
       const ytFrames = await getYouTubeFrames(ytId);
       if (ytFrames.length > 0) {
+        // YT frames can't be randomized easily via thumbnail API, so shuffling them
         return res.json({
           success: true,
           totalFrames: ytFrames.length,
-          frames: ytFrames
+          frames: ytFrames.sort(() => Math.random() - 0.5) // Random shuffle
         });
       }
     } catch (e) {}
@@ -208,7 +240,7 @@ app.all('/api/extract-frames', async (req, res) => {
         videoStreamUrl = await resolveInstagramFast(match[1]);
       }
     }
-    // 3. TikTok Check (handles vm.tiktok.com, vt.tiktok.com, and tiktok.com)
+    // 3. TikTok Check
     else if (inputUrl.includes('tiktok.com')) {
       tikTokData = await resolveTikTok(inputUrl);
       if (tikTokData && tikTokData.streamUrl) {
@@ -221,47 +253,33 @@ app.all('/api/extract-frames', async (req, res) => {
     }
 
     const framesBase64 = [];
+    const localVideoPath = path.join(tmpDir, 'video.mp4');
 
-    // FAST DIRECT EXTRACTION: Agar direct stream URL mil gaya (Instagram / TikTok / Snapchat)
     if (videoStreamUrl) {
-      // Direct stream extraction bina poori video download kiye (single pass, superfast)
+      // Direct stream fail-safe: Instead of guessing random stream offsets (which is unstable), 
+      // we download the small reel and extract accurately
       try {
-        const streamCmd = `ffmpeg -y -headers "User-Agent: Mozilla/5.0\\r\\n" -ss 00:00:01 -i "${videoStreamUrl}" -vf "fps=1/2" -vframes 3 -q:v 2 "${path.join(tmpDir, 'f_%d.jpg')}"`;
-        execSync(streamCmd, { timeout: 15000, stdio: 'ignore' });
-
-        for (let i = 1; i <= 3; i++) {
-          const p = path.join(tmpDir, `f_${i}.jpg`);
-          if (fs.existsSync(p) && fs.statSync(p).size > 0) {
-            framesBase64.push(`data:image/jpeg;base64,${fs.readFileSync(p).toString('base64')}`);
+        execSync(`curl -s -L -A "Mozilla/5.0" "${videoStreamUrl}" -o "${localVideoPath}"`, { timeout: 20000 });
+        if (fs.existsSync(localVideoPath) && fs.statSync(localVideoPath).size > 0) {
+          const timestamps = getRandomTimestamps(localVideoPath, 3);
+          for (let i = 0; i < timestamps.length; i++) {
+            const outPath = path.join(tmpDir, `fb_${i + 1}.jpg`);
+            try {
+              execSync(`ffmpeg -y -ss ${timestamps[i]} -i "${localVideoPath}" -vframes 1 -q:v 2 "${outPath}"`, { timeout: 5000, stdio: 'ignore' });
+              if (fs.existsSync(outPath) && fs.statSync(outPath).size > 0) {
+                framesBase64.push(`data:image/jpeg;base64,${fs.readFileSync(outPath).toString('base64')}`);
+              }
+            } catch (e) {}
           }
         }
-      } catch (streamErr) {
-        // Fallback: Agar stream fail hui toh fast download try karein
-        const localVideoPath = path.join(tmpDir, 'video.mp4');
-        try {
-          execSync(`curl -s -L -A "Mozilla/5.0" "${videoStreamUrl}" -o "${localVideoPath}"`, { timeout: 20000 });
-          if (fs.existsSync(localVideoPath) && fs.statSync(localVideoPath).size > 0) {
-            const timestamps = ['00:00:01', '00:00:03', '00:00:05'];
-            for (let i = 0; i < timestamps.length; i++) {
-              const outPath = path.join(tmpDir, `fb_${i + 1}.jpg`);
-              try {
-                execSync(`ffmpeg -y -ss ${timestamps[i]} -i "${localVideoPath}" -vframes 1 -q:v 2 "${outPath}"`, { timeout: 5000, stdio: 'ignore' });
-                if (fs.existsSync(outPath) && fs.statSync(outPath).size > 0) {
-                  framesBase64.push(`data:image/jpeg;base64,${fs.readFileSync(outPath).toString('base64')}`);
-                }
-              } catch (e) {}
-            }
-          }
-        } catch (downloadErr) {}
-      }
+      } catch (err) {}
     } else {
-      // Facebook & generic video links via yt-dlp
-      const localVideoPath = path.join(tmpDir, 'video.mp4');
+      // Facebook & generic links
       const ytdlpCmd = `yt-dlp -f "b[ext=mp4]/b" --no-playlist --socket-timeout 15 -o "${localVideoPath}" "${inputUrl}"`;
       execSync(ytdlpCmd, { timeout: 35000, stdio: 'ignore' });
 
       if (fs.existsSync(localVideoPath) && fs.statSync(localVideoPath).size > 0) {
-        const timestamps = ['00:00:01', '00:00:03', '00:00:05'];
+        const timestamps = getRandomTimestamps(localVideoPath, 3);
         for (let i = 0; i < timestamps.length; i++) {
           const outPath = path.join(tmpDir, `frame_${i + 1}.jpg`);
           try {
@@ -274,7 +292,6 @@ app.all('/api/extract-frames', async (req, res) => {
       }
     }
 
-    // Safety Fallback for TikTok (Cover images if any error happens)
     if (framesBase64.length === 0 && tikTokData && tikTokData.covers.length > 0) {
       for (const cov of tikTokData.covers) {
         try {
